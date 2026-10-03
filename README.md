@@ -38,7 +38,7 @@ graph LR
 
     subgraph DP["DATA PLANE (VM Linux)"]
     SB["SANDBOX<br>único lugar de escrita"]
-    LG["LOGS / DLQ<br>somente leitura"]
+    LG["LOGS / DLQ<br>cópia somente leitura"]
     PG["PostgreSQL SINTÉTICO<br>alvo do Red Team"]
     end
 
@@ -108,11 +108,34 @@ Passei a usar o Qwen 3 8B como worker. Um erro continua: ao comparar três arqui
 
 ## Vigia
 
-O Vigia roda checagens sem IA, a cada ciclo: conta linhas por nível de log e arquivos novos na DLQ. Só quando uma regra dispara é que o Claude e os workers entram em cena. As regras ficam num JSON (alvo, quantas ocorrências novas, tempo de espera entre disparos e a ordem que o Master recebe).
+O Vigia roda checagens sem IA, a cada ciclo: conta linhas por texto ou por nível de log, conta arquivos novos na DLQ e confere a idade de um arquivo. Só quando uma regra dispara é que o Claude e os workers entram em cena. As regras ficam num JSON (alvo, quantas ocorrências novas, tempo de espera entre disparos e a ordem que o Master recebe).
 
-A primeira leitura só grava uma linha de base, então ele não dispara por histórico antigo. Há tempo mínimo entre disparos, um teto por hora, e ele adia se já houver operação em andamento, aprovação pendente ou standby. Fica desligado por padrão e eu ligo no painel.
+A primeira leitura só grava uma linha de base, então ele não dispara por histórico antigo. Há tempo mínimo entre disparos, um teto por hora, e ele adia se já houver operação em andamento, aprovação pendente ou standby. Tem também uma pausa no horário em que eu mais uso o sistema (hoje, das 14h às 15h), quando ele não faz checagem nenhuma. Fica desligado por padrão e eu ligo no painel.
 
-Quando dispara, a operação é automática e somente leitura: qualquer escrita, script ou consulta de Red Team é negado sem nem pedir minha aprovação. Testei de ponta a ponta numa VM real. Acrescentei 4 erros a um log de teste, o gatilho disparou sozinho no ciclo seguinte, o worker contou e leu o log e o juiz avaliou. Nada foi escrito.
+Quando dispara, a operação é automática e somente leitura: qualquer escrita, script ou consulta de Red Team é negado sem nem pedir minha aprovação.
+
+### Como ele enxerga os logs do SaaS
+
+O SaaS real é um app desktop que eu abro à mão, e os logs ficam dentro da minha pasta pessoal, ao lado de coisa que o agente não pode ver (credenciais, dados de cliente, fotos). Dar permissão de leitura nessa pasta estava fora de cogitação.
+
+A solução foi uma cópia. Um script do `root`, agendado a cada 5 minutos, copia só três caminhos (o log da aplicação, o log de falhas críticas e a pasta da DLQ) para uma pasta fora da minha home. O usuário do agente lê essa cópia e não consegue escrever nela nem trocar nada. Ajustei o desenho original por causa de um risco clássico: um processo `root` escrevendo dentro de uma pasta controlada por outro usuário pode ser enganado com um link simbólico. Por isso o destino pertence ao `root`, e a cópia não segue links.
+
+As regras olham a cópia: erros novos no log da aplicação, avisos em excesso, qualquer linha nova no log de falhas, arquivos novos na DLQ, e uma regra que dispara se o carimbo da cópia parar de atualizar por mais de 20 minutos (para eu saber se o próprio monitoramento quebrou).
+
+Validei o Vigia de ponta a ponta numa VM real: acrescentei 4 erros a um log de teste, o gatilho disparou sozinho no ciclo seguinte, o worker contou e leu o log e o juiz avaliou. Nada foi escrito.
+
+---
+
+## Teste com log de verdade
+
+Depois de configurar a cópia, rodei uma operação manual de leitura sobre o log real do SaaS. Não passou de primeira, e cada falha apontou um problema diferente:
+
+1. O worker olhou a pasta errada, achou o diretório vazio e respondeu "0 erros". Era invenção, e o juiz reprovou com nota 1. O prompt dele ainda dizia que só podia olhar o sandbox. Passei a informar as pastas extras de leitura e a exigir caminho absoluto, e acrescentei a regra de nunca responder "0" sem ter contado o arquivo certo.
+2. O contador por nível devolvia 0 porque o log usa `[ERROR]` com colchetes e eu comparava com `ERROR`. Ajustei para aceitar os dois.
+3. O worker contava certo mas não tinha como ler a linha do erro (a ferramenta de leitura só traz o final do arquivo) e acabou inventando o resumo. Criei uma ferramenta que mostra as linhas que contêm um texto.
+4. Na última rodada ele contou certo (1 erro, 21 avisos) e citou a linha real do log. O juiz ainda reprovou, com nota 6, só porque ele citou a linha em vez de resumir em duas ou três frases.
+
+O que mais me convenceu nesse teste foi o juiz: nas duas primeiras rodadas ele barrou respostas inventadas que pareciam plausíveis.
 
 ---
 
@@ -142,7 +165,7 @@ Empacotei o painel num executável com PyInstaller, com um modo `--autoteste` qu
 
 ## Testes
 
-São 231 testes automatizados no modo padrão: segurança, grafo com modelos e VM simulados, memória, cota, Vigia, contagem e validador de SQL. Outros testes só rodam quando ligo uma variável de ambiente e usam a VM de verdade (contagem, Vigia) e o banco de testes (papéis, bloqueio de DDL, escopo de rede). Também fiz testes ponta a ponta com Claude e modelo local contra a VM real, incluindo a aprovação humana de uma escrita. Cada um custou entre 3 e 5 mil tokens, menos de um centavo de dólar.
+São 239 testes automatizados no modo padrão: segurança, grafo com modelos e VM simulados, memória, cota, Vigia, contagem e validador de SQL. Outros testes só rodam quando ligo uma variável de ambiente e usam a VM de verdade (contagem, Vigia) e o banco de testes (papéis, bloqueio de DDL, escopo de rede). Também fiz testes ponta a ponta com Claude e modelo local contra a VM real, incluindo a aprovação humana de uma escrita. Cada um custou entre 3 e 5 mil tokens, menos de um centavo de dólar.
 
 A regra que segui: tudo roda primeiro com SSH e modelos falsos, depois contra a VM só para leitura, e só no final com execução liberada.
 
@@ -150,11 +173,12 @@ A regra que segui: tudo roda primeiro com SSH e modelos falsos, depois contra a 
 
 ## O que ainda não está bom
 
-- O Vigia foi validado em logs de teste. Vigiar os logs e a DLQ reais do SaaS depende de eu dar permissão de leitura a pastas específicas, e isso ainda não foi feito.
+- O Vigia já aponta para a cópia dos logs reais do SaaS e a operação manual de leitura funcionou, mas ainda não o vi reagir a um uso de verdade: os logs atuais são antigos, porque o app só roda quando eu o abro.
 - A execução de scripts não roda num sandbox de sistema operacional. A proteção hoje é o usuário sem privilégios, o sandbox de pastas e a aprovação humana.
 - O Circuit Breaker estima o gasto pela contagem de tokens da biblioteca, e ainda não lê os cabeçalhos de limite de taxa da API.
 - Modelos de 7 a 8B ainda erram tarefas de vários passos. Compenso fatiando melhor o trabalho e usando o juiz.
 - Ainda não avaliei um modelo específico para escrever scripts.
+- O juiz é rígido com o formato da resposta (reprovou uma resposta correta por citar a linha em vez de resumir). Prefiro isso a um juiz frouxo, mas ainda preciso calibrar a rubrica.
 
 ---
 
